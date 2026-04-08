@@ -36,9 +36,6 @@ Thumbs.db
 *.stackdump
 [Dd]esktop.ini
 
-# Training data (collected samples)
-training_data/
-
 # C Prerequisites
 *.d
 
