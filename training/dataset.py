@@ -5,6 +5,7 @@ JSONL dataset management for ghost-writer training samples.
 Each line is a JSON object with accelerometer data paired with a word label.
 """
 
+import glob
 import json
 import os
 import uuid
@@ -65,9 +66,55 @@ def delete_sample(filepath, sample_id):
     return True
 
 
+def load_all_samples(dataset_dir):
+    """Load samples from the legacy samples.jsonl AND all session files.
+
+    Args:
+        dataset_dir: path to training_data/ directory
+
+    Returns:
+        list of sample dicts (deduplicated by id)
+    """
+    seen_ids = set()
+    all_samples = []
+
+    # Legacy file
+    legacy = os.path.join(dataset_dir, "samples.jsonl")
+    for s in load_samples(legacy):
+        if s["id"] not in seen_ids:
+            seen_ids.add(s["id"])
+            all_samples.append(s)
+
+    # Session files
+    sessions_dir = os.path.join(dataset_dir, "sessions")
+    for path in sorted(glob.glob(os.path.join(sessions_dir, "*.jsonl"))):
+        for s in load_samples(path):
+            if s["id"] not in seen_ids:
+                seen_ids.add(s["id"])
+                all_samples.append(s)
+
+    return all_samples
+
+
 def get_stats(filepath):
     """Return dataset statistics: total count, per-word counts, total duration."""
     samples = load_samples(filepath)
+    words = {}
+    total_duration = 0.0
+    for s in samples:
+        w = s.get("word", "")
+        words[w] = words.get(w, 0) + 1
+        total_duration += s.get("duration_s", 0.0)
+    return {
+        "total_samples": len(samples),
+        "words": words,
+        "total_duration_s": round(total_duration, 1),
+    }
+
+
+def get_all_stats(dataset_dir):
+    """Return dataset statistics across all session files + legacy samples.jsonl."""
+    samples = load_all_samples(dataset_dir)
     words = {}
     total_duration = 0.0
     for s in samples:

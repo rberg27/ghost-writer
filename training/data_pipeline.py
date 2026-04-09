@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .dataset import load_samples
+from .dataset import load_samples, load_all_samples
 
 
 # ---------------------------------------------------------------------------
@@ -106,17 +106,28 @@ def augment(samples_xyz, rng=None):
 # PyTorch Datasets
 # ---------------------------------------------------------------------------
 
+def _load(path):
+    """Load samples from a single JSONL file or a training_data/ directory."""
+    import os
+    if os.path.isdir(path):
+        return load_all_samples(path)
+    return load_samples(path)
+
+
 class WordDataset(Dataset):
     """
     Phase 1: word-level classification dataset.
 
     Each item: (features_tensor, word_index)
+
+    ``path`` can be a single .jsonl file or the training_data/ directory
+    (loads all session files + legacy samples.jsonl).
     """
 
-    def __init__(self, filepath, word_to_idx=None, augment_data=False, seed=42):
-        raw_samples = load_samples(filepath)
+    def __init__(self, path, word_to_idx=None, augment_data=False, seed=42):
+        raw_samples = _load(path)
         if not raw_samples:
-            raise ValueError(f"No samples found in {filepath}")
+            raise ValueError(f"No samples found in {path}")
 
         # Build vocabulary from data if not provided
         all_words = sorted(set(s["word"].lower() for s in raw_samples))
@@ -158,12 +169,12 @@ class CTCDataset(Dataset):
     Each item: (features_tensor, target_indices, target_length)
     """
 
-    def __init__(self, filepath, augment_data=False, seed=42):
+    def __init__(self, path, augment_data=False, seed=42):
         from .model import encode_text
 
-        raw_samples = load_samples(filepath)
+        raw_samples = _load(path)
         if not raw_samples:
-            raise ValueError(f"No samples found in {filepath}")
+            raise ValueError(f"No samples found in {path}")
 
         self.samples = raw_samples
         self.augment_data = augment_data

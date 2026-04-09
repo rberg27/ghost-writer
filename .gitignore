@@ -53,3 +53,13 @@ Thumbs.db
 *.su
 *.idb
 *.pdb
+
+# Python
+__pycache__/
+*.pyc
+
+# ML artifacts
+*.pt
+
+# Audio recordings
+*.wav

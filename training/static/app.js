@@ -227,6 +227,10 @@ function connectWS() {
             case "session_stopped":
                 onSessionStopped(data);
                 break;
+
+            case "session_finalized":
+                onSessionFinalized(data);
+                break;
         }
     };
 
@@ -243,10 +247,13 @@ function connectWS() {
 connectWS();
 
 // ─── Session (continuous recording) ─────────────────────
+let sessionNeedsFinalize = false;
+
 $sessionBtn.addEventListener("click", () => {
     if (!connected) return;
     if (!sessionActive) {
         sessionActive = true;
+        sessionNeedsFinalize = false;
         sessionStartTime = performance.now();
         $sessionBtn.textContent = "Stop Session";
         $sessionBtn.className = "session-btn-active";
@@ -260,6 +267,7 @@ $sessionBtn.addEventListener("click", () => {
         ws.send(JSON.stringify({ type: "start_session" }));
     } else {
         sessionActive = false;
+        sessionNeedsFinalize = true;
         clearInterval(sessionTimer);
         $sessionBtn.textContent = "Start Session";
         $sessionBtn.className = "session-btn-idle";
@@ -268,10 +276,25 @@ $sessionBtn.addEventListener("click", () => {
 });
 
 function onSessionStopped(data) {
-    $sessionStatus.textContent = `Saved ${data.file} — ${data.duration_s}s, ${data.num_samples} pts`;
-    setTimeout(() => {
-        if (!sessionActive) $sessionStatus.textContent = "";
-    }, 8000);
+    $sessionStatus.textContent = `Stopped — ${data.duration_s}s recorded. Save words then click Save All to finalize.`;
+}
+
+function finalizeSession() {
+    if (!sessionNeedsFinalize) return;
+    sessionNeedsFinalize = false;
+    // Send the final word order with line numbers so the server
+    // can annotate the CSV correctly
+    const words = savedHistory.slice().reverse().map(h => ({
+        sample_id: h.id,
+        word: h.word,
+        line: h.line || 1,
+    }));
+    ws.send(JSON.stringify({ type: "finalize_session", words: words }));
+}
+
+function onSessionFinalized(data) {
+    $sessionStatus.textContent = `Session saved: ${data.file}`;
+    setTimeout(() => { $sessionStatus.textContent = ""; }, 8000);
 }
 
 // ─── Record button ──────────────────────────────────────
@@ -423,6 +446,10 @@ $newlineBtn.addEventListener("click", () => {
     currentLine++;
     pendingQueue.push({ type: "newline", line: currentLine });
     $transcriptLineNum.textContent = `Line ${currentLine}`;
+    // Notify server for session CSV annotation
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "mark_newline", line: currentLine }));
+    }
     renderQueue();
     renderTranscript();
 });
@@ -483,6 +510,32 @@ function renderQueue() {
 
     $queueList.innerHTML = "";
     let wordNum = 0;
+
+    // Helper: insert-newline button between items
+    function addInsertBtn(insertAtIdx) {
+        const wrap = document.createElement("div");
+        wrap.className = "queue-insert-wrap";
+        const btn = document.createElement("button");
+        btn.className = "queue-insert-btn";
+        btn.textContent = "+ New Line";
+        btn.addEventListener("click", () => {
+            const prevLine = insertAtIdx > 0
+                ? (pendingQueue[insertAtIdx - 1].line || currentLine)
+                : 1;
+            currentLine = prevLine + 1;
+            pendingQueue.splice(insertAtIdx, 0, { type: "newline", line: currentLine });
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: "mark_newline", line: currentLine }));
+            }
+            recalcLines();
+            renderQueue();
+            renderTranscript();
+            $transcriptLineNum.textContent = `Line ${currentLine}`;
+        });
+        wrap.appendChild(btn);
+        $queueList.appendChild(wrap);
+    }
+
     for (let idx = 0; idx < pendingQueue.length; idx++) {
         const entry = pendingQueue[idx];
 
@@ -523,6 +576,10 @@ function renderQueue() {
             });
             sep.appendChild(removeBtn);
             $queueList.appendChild(sep);
+            // Insert-newline button after this separator (only if next item isn't also a newline)
+            if (idx < pendingQueue.length - 1 && pendingQueue[idx + 1].type !== "newline") {
+                addInsertBtn(idx + 1);
+            }
             continue;
         }
 
@@ -609,6 +666,11 @@ function renderQueue() {
 
         card.appendChild(row);
         $queueList.appendChild(card);
+
+        // Insert-newline button between word cards (skip if next is already a newline)
+        if (idx < pendingQueue.length - 1 && pendingQueue[idx + 1].type !== "newline") {
+            addInsertBtn(idx + 1);
+        }
 
         requestAnimationFrame(() => {
             const miniChart = new AccelChart(canvas, {
@@ -801,6 +863,7 @@ async function saveAllQueue() {
     renderQueue();
     renderHistory();
     renderTranscript();
+    finalizeSession();
 }
 
 function discardAllQueue() {

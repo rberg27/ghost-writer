@@ -54,9 +54,11 @@ class SerialBridge:
 
         # Session recording state (continuous, captures gaps between words)
         self.session_active = False
-        self.session_buffer = []
+        self.session_buffer = []       # [(x, y, z, t, writing)]
         self.session_start = 0.0
         self.session_wall_clock = ""
+        # Events log: annotated at CSV write time
+        self.session_events = []       # [{"type": "word", "t_start", "t_stop", "word", "sample_id"}, {"type": "newline", "t"}]
 
         # Subscribers (async queues for each connected WS client)
         self.subscribers = set()
@@ -116,7 +118,7 @@ class SerialBridge:
                     if self.recording:
                         self.recording_buffer.append((x, y, z, t))
                     if self.session_active:
-                        self.session_buffer.append((x, y, z, t))
+                        self.session_buffer.append((x, y, z, t, 1 if self.recording else 0))
 
                 # Push to subscribers
                 if self.loop is not None and self.subscribers:
@@ -178,17 +180,29 @@ class SerialBridge:
         with self.lock:
             self.session_active = True
             self.session_buffer = []
+            self.session_events = []
             self.session_start = time.time()
             self.session_wall_clock = datetime.now(timezone.utc).isoformat()
 
     def stop_session(self):
+        """Stop recording but keep the buffer for annotation."""
         with self.lock:
             self.session_active = False
+
+    def finalize_session(self):
+        """Return session data and clear the buffer."""
+        with self.lock:
             buf = list(self.session_buffer)
+            events = list(self.session_events)
             start = self.session_start
             wall_clock = self.session_wall_clock
             self.session_buffer = []
-        return buf, start, wall_clock
+            self.session_events = []
+        return buf, start, wall_clock, events
+
+    def add_session_event(self, event):
+        with self.lock:
+            self.session_events.append(event)
 
     def stop(self):
         self.running = False
@@ -259,8 +273,12 @@ def build_app(bridge, dataset_path):
 
         q = bridge.subscribe()
         pending_samples = {}
-        # Per-session JSONL path (None = no active session)
-        session_jsonl = None
+        # Per-session JSONL path — always set (auto-created if no explicit session)
+        sessions_dir = dataset_path.parent / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        auto_id = str(uuid.uuid4())[:8]
+        auto_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        session_jsonl = str(sessions_dir / f"session_{auto_ts}_{auto_id}.jsonl")
 
         # Send initial status
         await ws.send_str(json.dumps({
@@ -295,11 +313,21 @@ def build_app(bridge, dataset_path):
 
                     if cmd == "start_recording":
                         bridge.start_recording()
+                        bridge.add_session_event({
+                            "type": "word_start",
+                            "t": time.time(),
+                        })
                         await ws.send_str(json.dumps({"type": "recording_started"}))
 
                     elif cmd == "stop_recording":
+                        stop_t = time.time()
                         buf, start, wall_clock = bridge.stop_recording()
                         sample_id = str(uuid.uuid4())
+                        bridge.add_session_event({
+                            "type": "word_stop",
+                            "t": stop_t,
+                            "sample_id": sample_id,
+                        })
                         samples_list = [[x, y, z] for x, y, z, t in buf]
                         timestamps = [round(t - start, 4) for x, y, z, t in buf]
                         duration = timestamps[-1] if timestamps else 0.0
@@ -317,6 +345,15 @@ def build_app(bridge, dataset_path):
                     elif cmd == "save_sample":
                         sid = data["sample_id"]
                         word = data["word"].strip()
+                        line = data.get("line", 1)
+                        # Annotate the corresponding word_stop event with the word and line
+                        with bridge.lock:
+                            for evt in reversed(bridge.session_events):
+                                if evt["type"] == "word_stop" and "word" not in evt:
+                                    evt["word"] = word
+                                    evt["line"] = line
+                                    evt["sample_id"] = sid
+                                    break
                         if sid in pending_samples and word:
                             samples_list, timestamps, wall_clock = pending_samples.pop(sid)
                             audio_dir = dataset_path.parent / "audio"
@@ -337,6 +374,13 @@ def build_app(bridge, dataset_path):
                                 "sample_id": sid,
                                 **stats,
                             }))
+
+                    elif cmd == "mark_newline":
+                        bridge.add_session_event({
+                            "type": "newline",
+                            "t": time.time(),
+                            "to_line": data.get("line", 0),
+                        })
 
                     elif cmd == "discard_sample":
                         sid = data.get("sample_id", "")
@@ -359,24 +403,92 @@ def build_app(bridge, dataset_path):
                         }))
 
                     elif cmd == "stop_session":
-                        buf, start, wall_clock = bridge.stop_session()
-                        # Save continuous accel stream as CSV
+                        # Stop recording but keep buffer for annotation
+                        bridge.stop_session()
+                        buf_len = len(bridge.session_buffer)
+                        start = bridge.session_start
+                        duration = (bridge.session_buffer[-1][3] - start) if bridge.session_buffer else 0.0
+                        await ws.send_str(json.dumps({
+                            "type": "session_stopped",
+                            "num_samples": buf_len,
+                            "duration_s": round(duration, 2),
+                        }))
+
+                    elif cmd == "finalize_session":
+                        # Client sends the final word order with line numbers
+                        # so we know where newlines go
+                        word_order = data.get("words", [])
+                        # e.g. [{"sample_id": "...", "word": "the", "line": 1},
+                        #        {"sample_id": "...", "word": "quick", "line": 1},
+                        #        {"sample_id": "...", "word": "brown", "line": 2}]
+
+                        buf, start, wall_clock, events = bridge.finalize_session()
                         import csv as csv_mod
                         csv_path = Path(session_jsonl).with_suffix(".csv") if session_jsonl else None
                         if csv_path and buf:
+                            # Build word time ranges from events
+                            # Pair word_start/word_stop events in order
+                            word_ranges = []  # [(t_start, t_stop, sample_id)]
+                            pending_start = None
+                            for evt in events:
+                                if evt["type"] == "word_start":
+                                    pending_start = evt["t"]
+                                elif evt["type"] == "word_stop" and pending_start is not None:
+                                    word_ranges.append((
+                                        pending_start, evt["t"],
+                                        evt.get("sample_id", ""),
+                                    ))
+                                    pending_start = None
+
+                            # Map sample_id → word and line from client's final order
+                            word_map = {}
+                            for wo in word_order:
+                                word_map[wo["sample_id"]] = (wo["word"], wo.get("line", 1))
+
+                            # Annotate word_ranges with word/line from the map
+                            annotated_ranges = []
+                            for t_start, t_stop, sid in word_ranges:
+                                w, ln = word_map.get(sid, ("", 1))
+                                annotated_ranges.append((t_start, t_stop, w, ln))
+
+                            # Find gaps where line number changes between consecutive words
+                            # newline=1 for all idle samples in those gaps
+                            newline_gaps = []  # [(gap_start, gap_end)]
+                            for i in range(len(annotated_ranges) - 1):
+                                _, t_stop_a, _, line_a = annotated_ranges[i]
+                                t_start_b, _, _, line_b = annotated_ranges[i + 1]
+                                if line_a != line_b:
+                                    newline_gaps.append((t_stop_a, t_start_b))
+
+                            # Write annotated CSV
                             with open(csv_path, "w", newline="") as f:
-                                w = csv_mod.writer(f)
-                                w.writerow(["elapsed_s", "x_g", "y_g", "z_g"])
-                                for x, y, z, t in buf:
-                                    w.writerow([f"{t - start:.4f}", f"{x:.4f}", f"{y:.4f}", f"{z:.4f}"])
-                        duration = (buf[-1][3] - start) if buf else 0.0
+                                wr = csv_mod.writer(f)
+                                wr.writerow(["elapsed_s", "x_g", "y_g", "z_g",
+                                             "writing", "word", "newline"])
+                                for x, y, z, t, writing_flag in buf:
+                                    elapsed = t - start
+                                    # Word label
+                                    word_label = ""
+                                    for t_s, t_e, w, ln in annotated_ranges:
+                                        if t_s <= t <= t_e:
+                                            word_label = w
+                                            break
+                                    # Newline: 1 if idle and in a gap where line changed
+                                    nl = 0
+                                    if not writing_flag:
+                                        for g_start, g_end in newline_gaps:
+                                            if g_start <= t <= g_end:
+                                                nl = 1
+                                                break
+                                    wr.writerow([f"{elapsed:.4f}", f"{x:.4f}",
+                                                 f"{y:.4f}", f"{z:.4f}",
+                                                 writing_flag, word_label, nl])
+
                         session_name = Path(session_jsonl).stem if session_jsonl else ""
-                        session_jsonl = None  # close session
+                        session_jsonl = None
                         await ws.send_str(json.dumps({
-                            "type": "session_stopped",
+                            "type": "session_finalized",
                             "file": session_name,
-                            "num_samples": len(buf),
-                            "duration_s": round(duration, 2),
                         }))
 
                     elif cmd == "get_stats":
