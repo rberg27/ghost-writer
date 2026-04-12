@@ -3,12 +3,14 @@ training/model.py
 
 PyTorch model definitions for ghost-writer handwriting recognition.
 
-Phase 1: WordClassifier  — CNN + GlobalAvgPool → word-level classification
-Phase 2: CTCRecognizer   — CNN + BiLSTM + CTC  → character-level decoding
+Phase 1: WordClassifier       — CNN + GlobalAvgPool → word-level classification
+Phase 2: CTCRecognizer        — CNN + BiLSTM + CTC  → character-level decoding
+Segmentation: SegmentationTCN — causal TCN → per-sample writing/gap detection
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class ConvBlock(nn.Module):
@@ -157,3 +159,74 @@ class CTCRecognizer(nn.Module):
             (x.size(0),), x.size(1), dtype=torch.long
         )
         return log_probs, output_lengths
+
+
+# ---------------------------------------------------------------------------
+# Segmentation: TCN for writing/gap detection
+# ---------------------------------------------------------------------------
+
+class CausalConv1d(nn.Module):
+    """Conv1d with left-only padding so output[t] depends only on input[<=t]."""
+
+    def __init__(self, in_ch, out_ch, kernel_size, dilation):
+        super().__init__()
+        self.pad = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size, dilation=dilation)
+
+    def forward(self, x):
+        x = F.pad(x, (self.pad, 0))
+        return self.conv(x)
+
+
+class TCNBlock(nn.Module):
+    """Two causal convolutions with residual connection."""
+
+    def __init__(self, channels, kernel_size, dilation, dropout=0.1):
+        super().__init__()
+        self.conv1 = CausalConv1d(channels, channels, kernel_size, dilation)
+        self.bn1 = nn.BatchNorm1d(channels)
+        self.conv2 = CausalConv1d(channels, channels, kernel_size, dilation)
+        self.bn2 = nn.BatchNorm1d(channels)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        r = x
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.drop(x)
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.drop(x)
+        return x + r
+
+
+class SegmentationTCN(nn.Module):
+    """
+    Causal temporal convolutional network for binary segmentation.
+
+    Takes a continuous accelerometer stream and outputs a per-sample
+    probability that the pen is currently writing (vs. in a between-word gap).
+
+    Receptive field with default settings (5 blocks, kernel 3):
+      sum of d*(K-1)*2 for d in [1,2,4,8,16] = 2*(1+2+4+8+16)*2 = 124 samples
+      ≈ 2.5s at 50Hz — covers a full word.
+
+    Input : (batch, time, in_channels)
+    Output: (batch, time)  — raw logits, apply sigmoid for probabilities
+    """
+
+    def __init__(self, in_channels=3, hidden=64, kernel_size=3,
+                 num_blocks=5, dropout=0.1):
+        super().__init__()
+        self.input_proj = nn.Conv1d(in_channels, hidden, 1)
+        self.blocks = nn.ModuleList([
+            TCNBlock(hidden, kernel_size, dilation=2**i, dropout=dropout)
+            for i in range(num_blocks)
+        ])
+        self.output_proj = nn.Conv1d(hidden, 1, 1)
+
+    def forward(self, x, lengths=None):
+        x = x.transpose(1, 2)              # (batch, channels, time)
+        x = self.input_proj(x)
+        for block in self.blocks:
+            x = block(x)
+        x = self.output_proj(x).squeeze(1)  # (batch, time)
+        return x

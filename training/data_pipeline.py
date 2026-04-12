@@ -3,12 +3,16 @@ training/data_pipeline.py
 
 PyTorch Dataset and feature engineering for ghost-writer.
 Loads JSONL samples, computes 10-dim features, handles padding & augmentation.
+Also provides SegmentationDataset for continuous session CSV streams.
 """
 
+import glob
 import math
+import os
 import random
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
@@ -18,6 +22,58 @@ from .dataset import load_samples, load_all_samples
 # ---------------------------------------------------------------------------
 # Feature engineering
 # ---------------------------------------------------------------------------
+
+def trim_idle(samples_xyz, margin=3, min_len=20):
+    """
+    Trim leading idle from raw [[x,y,z], ...] data.
+
+    Compares energy in a sliding window against the peak writing energy
+    (middle of the sample) to find where actual writing begins. Only
+    trims the leading portion — trailing is already handled by the
+    auto-segmenter.
+    """
+    arr = np.array(samples_xyz, dtype=np.float32)
+    if len(arr) < min_len:
+        return samples_xyz
+
+    deltas = np.diff(arr, axis=0)
+    energy = np.sqrt((deltas ** 2).sum(axis=1))
+
+    # Smooth energy with rolling window of 5
+    kernel = 5
+    if len(energy) >= kernel:
+        smooth = np.convolve(energy, np.ones(kernel) / kernel, mode='valid')
+    else:
+        return samples_xyz
+
+    # Reference: peak energy in middle third (where writing is happening)
+    mid_start = len(smooth) // 3
+    mid_end = 2 * len(smooth) // 3
+    if mid_start >= mid_end:
+        return samples_xyz
+    peak_energy = np.percentile(smooth[mid_start:mid_end], 75)
+
+    # Threshold: 30% of peak writing energy
+    threshold = peak_energy * 0.30
+    if threshold < 0.05:
+        return samples_xyz
+
+    # Find first point where smoothed energy exceeds threshold
+    start = 0
+    for i in range(len(smooth)):
+        if smooth[i] > threshold:
+            start = max(0, i - margin)
+            break
+
+    if start < 3:
+        return samples_xyz  # nothing meaningful to trim
+
+    # Ensure we keep enough samples
+    if len(arr) - start < min_len:
+        return samples_xyz
+
+    return arr[start:].tolist()
+
 
 def compute_features(samples_xyz):
     """
@@ -151,7 +207,7 @@ class WordDataset(Dataset):
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        xyz = sample["samples"]
+        xyz = trim_idle(sample["samples"])
 
         if self.augment_data:
             xyz = augment(xyz, rng=self.rng)
@@ -186,7 +242,7 @@ class CTCDataset(Dataset):
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        xyz = sample["samples"]
+        xyz = trim_idle(sample["samples"])
 
         if self.augment_data:
             xyz = augment(xyz, rng=self.rng)
@@ -218,3 +274,52 @@ def collate_ctc(batch):
     padded_features = torch.nn.utils.rnn.pad_sequence(features_list, batch_first=True)
     targets = torch.cat(target_list)  # CTC expects flat target tensor
     return padded_features, targets, lengths, target_lengths
+
+
+# ---------------------------------------------------------------------------
+# Segmentation dataset — continuous session CSVs
+# ---------------------------------------------------------------------------
+
+class SegmentationDataset(Dataset):
+    """
+    Loads session CSVs and slices them into overlapping windows for
+    per-sample writing/gap classification.
+
+    Each item: (features, labels)
+      features: (window_size, 3) float32 — raw x, y, z
+      labels:   (window_size,)  float32 — 1.0 = writing, 0.0 = gap
+    """
+
+    def __init__(self, csv_paths, window_size=128, stride=32, augment_data=False):
+        self.windows = []
+        self.augment_data = augment_data
+
+        for p in csv_paths:
+            df = pd.read_csv(p)
+            xyz = df[["x_g", "y_g", "z_g"]].values.astype(np.float32)
+            labels = df["writing"].values.astype(np.float32)
+            for start in range(0, len(df) - window_size + 1, stride):
+                self.windows.append((
+                    xyz[start : start + window_size],
+                    labels[start : start + window_size],
+                ))
+
+    def __len__(self):
+        return len(self.windows)
+
+    def __getitem__(self, idx):
+        xyz, labels = self.windows[idx]
+        xyz = xyz.copy()
+
+        if self.augment_data:
+            # Light noise + small gain jitter
+            xyz += np.random.normal(0, 0.005, xyz.shape).astype(np.float32)
+            xyz *= np.random.uniform(0.95, 1.05)
+
+        return torch.from_numpy(xyz), torch.from_numpy(labels)
+
+
+def find_session_csvs(data_dir):
+    """Return sorted list of session CSV paths in a training_data directory."""
+    sessions_dir = os.path.join(data_dir, "sessions")
+    return sorted(glob.glob(os.path.join(sessions_dir, "session_*.csv")))
